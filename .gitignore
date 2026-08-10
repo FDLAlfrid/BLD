@@ -1,0 +1,28 @@
+﻿# 虚拟环境
+venv/
+venv_bili/
+env/
+ENV/
+
+# 打包相关
+build/
+dist/
+*.spec
+*.pyc
+__pycache__/
+
+# 运行产生的临时文件
+*.log
+history.json
+cookies.json
+*.mp4
+*.m4a
+
+# IDE 配置
+.vscode/
+.idea/
+*.swp
+
+# 系统文件
+Thumbs.db
+.DS_Store
