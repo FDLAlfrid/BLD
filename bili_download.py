@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 B站视频下载工具 - GUI版 (sv-ttk 主题)
-版本: 2.4 (暗色主题修复 & 性能优化)
-新增: 排行榜功能 (动态分区，热门视频浏览)
+版本: 2.4.1 (Edge Cookie 读取优化版)
+新增: 排行榜功能 / Edge 浏览器 Cookie 免关闭读取
 """
 import re
 import json
@@ -14,6 +14,8 @@ import os
 import sys
 import platform
 import io
+import shutil
+import tempfile
 import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, Menu
@@ -34,7 +36,7 @@ try:
 except ImportError:
     HAS_PIL = False
 
-__version__ = "2.4"
+__version__ = "2.4.1"
 
 # ---------- 程序目录（历史 / Cookies / 下载输出都放在此目录，避免写入用户目录） ----------
 def get_app_dir():
@@ -181,15 +183,64 @@ def load_cookies_from_file(filepath):
     else:
         raise ValueError("不支持的 cookies 格式")
 
+# ====================== Cookie 自动获取核心优化 ======================
+def _try_get_edge_cookies(browser_func):
+    """Edge Cookie 三层兜底读取：直读 → 指定路径 → 临时副本绕过文件锁"""
+    default_cookie_path = os.path.expandvars(
+        r"%LOCALAPPDATA%\Microsoft\Edge\User Data\Default\Network\Cookies"
+    )
+    
+    if not os.path.exists(default_cookie_path):
+        return None
+    
+    # 第1层：默认方式直接读取
+    try:
+        cj = browser_func(domain_name=".bilibili.com")
+        cookies = {c.name: c.value for c in cj if ".bilibili.com" in c.domain or "bilibili.com" in c.domain}
+        if cookies and "SESSDATA" in cookies:
+            return cookies
+    except Exception:
+        pass
+    
+    # 第2层：显式指定 Cookie 文件路径读取
+    try:
+        cj = browser_func(cookie_file=default_cookie_path, domain_name=".bilibili.com")
+        cookies = {c.name: c.value for c in cj if ".bilibili.com" in c.domain or "bilibili.com" in c.domain}
+        if cookies and "SESSDATA" in cookies:
+            return cookies
+    except Exception:
+        pass
+    
+    # 第3层：复制到临时目录读取（核心：绕过浏览器文件锁）
+    try:
+        temp_dir = tempfile.gettempdir()
+        temp_cookie = os.path.join(temp_dir, f"bld_edge_cookie_{int(time.time())}.db")
+        shutil.copy2(default_cookie_path, temp_cookie)
+        
+        try:
+            cj = browser_func(cookie_file=temp_cookie, domain_name=".bilibili.com")
+            cookies = {c.name: c.value for c in cj if ".bilibili.com" in c.domain or "bilibili.com" in c.domain}
+            if cookies and "SESSDATA" in cookies:
+                return cookies
+        finally:
+            # 清理临时文件
+            try:
+                os.remove(temp_cookie)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    
+    return None
+
 def get_cookies_from_browser_auto():
-    """优先从 Edge 获取 Cookies，失败则依次尝试其他浏览器"""
+    """优先从 Edge 获取 Cookies，支持浏览器运行时读取；失败依次尝试其他浏览器"""
     browsers = ["edge", "chrome", "chromium", "brave", "opera", "firefox"]
     is_windows = platform.system() == "Windows"
 
     for browser in browsers:
         try:
             import browser_cookie3
-            # 映射浏览器名称到 browser_cookie3 的函数
             func_name_map = {
                 "edge": "edge",
                 "chrome": "chrome",
@@ -205,40 +256,28 @@ def get_cookies_from_browser_auto():
 
             browser_func = getattr(browser_cookie3, func_name)
             
-            # Windows 下 Edge 额外尝试指定用户目录
+            # Windows 下 Edge 走三层兜底逻辑
             if browser == "edge" and is_windows:
+                cookies = _try_get_edge_cookies(browser_func)
+                if cookies and "SESSDATA" in cookies:
+                    return cookies, browser
+            else:
+                # 其他浏览器正常尝试
                 try:
                     cj = browser_func(domain_name=".bilibili.com")
+                    cookies = {}
+                    for c in cj:
+                        if ".bilibili.com" in c.domain or "bilibili.com" in c.domain:
+                            cookies[c.name] = c.value
+                    if cookies and "SESSDATA" in cookies:
+                        return cookies, browser
                 except Exception:
-                    # 尝试显式指定 Cookie 文件路径（Win10/11 默认路径）
-                    default_cookie_path = os.path.expandvars(
-                        r"%LOCALAPPDATA%\Microsoft\Edge\User Data\Default\Network\Cookies"
-                    )
-                    if os.path.exists(default_cookie_path):
-                        try:
-                            cj = browser_func(cookie_file=default_cookie_path, 
-                                            domain_name=".bilibili.com")
-                        except Exception:
-                            # 再尝试不指定 domain，全量提取后过滤
-                            cj = browser_func(cookie_file=default_cookie_path)
-                    else:
-                        raise
-            else:
-                cj = browser_func(domain_name=".bilibili.com")
-
-            # 提取 bilibili 相关 Cookie
-            cookies = {}
-            for c in cj:
-                if ".bilibili.com" in c.domain or "bilibili.com" in c.domain:
-                    cookies[c.name] = c.value
-            
-            # 关键凭证校验：至少要有 SESSDATA 才算有效登录
-            if cookies and "SESSDATA" in cookies:
-                return cookies, browser
+                    continue
         except Exception:
             continue
     
     return None, None
+# ====================================================================
 
 def get_wbi_keys(session, cookies=None):
     url = "https://api.bilibili.com/x/web-interface/nav"
@@ -574,8 +613,6 @@ class BiliDownloaderApp:
         # 延迟到首次切换到排行榜标签页时再初始化（避免启动卡顿）
         self._ranking_initialized = False
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
-
-        # 主题切换后刷新所有打开的对话框（如果有）—— 但此处简化，只刷新自身
 
     # ====================================================================
     # 全局样式 / 字体
@@ -1267,7 +1304,7 @@ class BiliDownloaderApp:
 
         cookies = self.get_cookies()
         if cookies is None:
-            self.log("未能获取 Cookies，将使用无 Cookie 模式（可能受限）", "WARNING")
+            self.log("未能获取有效登录 Cookies，将使用无 Cookie 模式（清晰度受限）", "WARNING")
 
         session = get_session_with_retry()
         try:
@@ -1336,6 +1373,7 @@ class BiliDownloaderApp:
             return None
 
         cookies = None
+        # 优先级1：用户手动指定的 Cookie 文件
         if self.cookies_file_var.get():
             try:
                 cookies = load_cookies_from_file(self.cookies_file_var.get())
@@ -1346,6 +1384,7 @@ class BiliDownloaderApp:
                 self._show_error("错误", f"加载 cookies 失败:\n{e}")
                 return None
         else:
+            # 优先级2：程序同目录的 cookies.json
             default_file = os.path.join(get_app_dir(), "cookies.json")
             if os.path.exists(default_file):
                 try:
@@ -1355,18 +1394,20 @@ class BiliDownloaderApp:
                 except Exception as e:
                     self.log(f"加载本地 cookies.json 失败: {e}", "WARNING")
 
-        self.log("尝试从浏览器获取 Cookies...")
+        # 优先级3：从浏览器自动获取（Edge 优先，支持运行中读取）
+        self.log("尝试从浏览器自动获取 Cookies（优先 Edge）...")
         try:
             cookies, browser = get_cookies_from_browser_auto()
             if cookies:
-                # 检查关键凭证
                 if "SESSDATA" in cookies:
                     self.log(f"已从 {browser} 获取 Cookies（登录有效）")
                     return cookies
                 else:
-                    self.log(f"从 {browser} 获取到 Cookies，但缺少 SESSDATA，可能未登录B站", "WARNING")
+                    self.log(f"从 {browser} 获取到 Cookie，但缺少 SESSDATA，可能未登录B站", "WARNING")
             else:
-                self.log("未能从任何浏览器获取有效登录凭证，将使用无 Cookie 模式（清晰度可能受限）", "WARNING")
+                self.log("未能从任何浏览器获取有效登录凭证", "WARNING")
+                self.log("提示：若浏览器正在运行，可能因文件锁定导致读取失败", "WARNING")
+                self.log("可尝试完全关闭浏览器后重试，或手动导出 cookies.json 放到程序目录", "WARNING")
         except Exception as e:
             self.log(f"浏览器自动获取失败: {e}", "WARNING")
 
@@ -2022,20 +2063,12 @@ class BiliDownloaderApp:
 • 下载完成后自动打开文件夹
 • 排行榜浏览 (动态分区，热门视频)
 
-更新日志 (v2.4):
-- 新增排行榜功能 (动态分区列表)
-- 界面使用标签页 (下载/排行榜)
-- 排行榜支持一键下载
-- 修复图标显示问题 (标题栏/任务栏)
-- 修复暗色主题不完整问题
-- 优化卡片视图加载性能
-- 优化 Edge 浏览器 Cookie 自动获取逻辑
-
-说明文档:
-• 使用前请确保已登录 B 站 (用于获取高画质)
-• 如需自动合并，请安装 ffmpeg 并添加至 PATH
-• 可勾选「不合并」仅下载音视频分离文件
-• 勾选「下载弹幕」可额外生成 XML 弹幕文件，用 PotPlayer/VLC 等播放器加载
+更新日志 (v2.4.1):
+- 优化 Edge 浏览器 Cookie 读取逻辑，支持浏览器运行时读取
+- Edge 采用三层兜底：直读 → 指定路径 → 临时副本绕过文件锁
+- 调整浏览器优先级，Edge 优先尝试
+- 增加 SESSDATA 有效性校验，避免假成功
+- 优化失败日志提示，给出明确解决方法
 
 Cookies 说明:
 • 勾选「使用Cookies」后，优先级: 指定文件 > 程序同目录 cookies.json > 浏览器自动获取
@@ -2043,20 +2076,9 @@ Cookies 说明:
 • 默认读取程序同目录的 cookies.json，无需手动指定
 • 支持两种 JSON 格式:
   1. 字典格式: {{"SESSDATA": "xxx", "bili_jct": "xxx"}}
-  2. 数组格式: 浏览器插件导出的 JSON 数组 [{{"name": "SESSDATA", "value": "xxx", ...}}, ...]
+  2. 数组格式: 浏览器插件导出的 JSON 数组
 • 关键字段: SESSDATA (登录凭证)、bili_jct (CSRF)
-• 浏览器自动获取优先尝试 Edge，支持 Windows 默认路径兜底
-
-排行榜说明:
-• 不需要 Cookies，公开接口直接访问
-• 三种维度: 人气榜 (历史热门)、最新发布 (分区新视频)、入站必看 (全站精选)
-• 支持表格/封面卡片两种视图，可多选批量下载
-
-弹幕说明:
-• 勾选「下载弹幕」后，下载视频时会额外获取并保存弹幕
-• 弹幕保存为与视频同名的 XML 文件（如 video.xml）
-• 使用分段接口，支持热门视频的大量弹幕
-• 格式标准，可被 PotPlayer、VLC、mpv 等播放器直接加载
+• 浏览器自动获取优先尝试 Edge，无需关闭浏览器也可读取
 
 GitHub 项目:
 • 本项目: https://github.com/FDLAlfrid/BLD
