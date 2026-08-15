@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 B站视频下载工具 - GUI版 (sv-ttk 主题)
-版本: 2.4.1 (Edge Cookie 读取优化版)
+版本: 0.2.6 (Edge Cookie 读取优化版)
 新增: 排行榜功能 / Edge 浏览器 Cookie 免关闭读取
 """
 import re
@@ -36,7 +36,7 @@ try:
 except ImportError:
     HAS_PIL = False
 
-__version__ = "2.4.1"
+__version__ = "0.2.6"
 
 # ---------- 程序目录（历史 / Cookies / 下载输出都放在此目录，避免写入用户目录） ----------
 def get_app_dir():
@@ -2063,7 +2063,7 @@ class BiliDownloaderApp:
 • 下载完成后自动打开文件夹
 • 排行榜浏览 (动态分区，热门视频)
 
-更新日志 (v2.4.1):
+更新日志 (v0.2.6):
 - 优化 Edge 浏览器 Cookie 读取逻辑，支持浏览器运行时读取
 - Edge 采用三层兜底：直读 → 指定路径 → 临时副本绕过文件锁
 - 调整浏览器优先级，Edge 优先尝试
