@@ -5,7 +5,6 @@ B站视频下载工具 - GUI版 (sv-ttk 主题)
 版本: 2.4 (暗色主题修复 & 性能优化)
 新增: 排行榜功能 (动态分区，热门视频浏览)
 """
-
 import re
 import json
 import time
@@ -13,12 +12,12 @@ import hashlib
 import subprocess
 import os
 import sys
+import platform
 import io
 import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, Menu
 import webbrowser
-
 import requests
 from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
@@ -183,17 +182,62 @@ def load_cookies_from_file(filepath):
         raise ValueError("不支持的 cookies 格式")
 
 def get_cookies_from_browser_auto():
-    browsers = ["chrome", "edge", "firefox", "brave", "opera"]
+    """优先从 Edge 获取 Cookies，失败则依次尝试其他浏览器"""
+    browsers = ["edge", "chrome", "chromium", "brave", "opera", "firefox"]
+    is_windows = platform.system() == "Windows"
+
     for browser in browsers:
         try:
             import browser_cookie3
-            browser_func = getattr(browser_cookie3, browser.lower())
-            cj = browser_func(domain_name=".bilibili.com")
-            cookies = {c.name: c.value for c in cj}
-            if cookies:
+            # 映射浏览器名称到 browser_cookie3 的函数
+            func_name_map = {
+                "edge": "edge",
+                "chrome": "chrome",
+                "chromium": "chromium",
+                "brave": "brave",
+                "opera": "opera",
+                "firefox": "firefox",
+            }
+            func_name = func_name_map.get(browser, browser)
+            
+            if not hasattr(browser_cookie3, func_name):
+                continue
+
+            browser_func = getattr(browser_cookie3, func_name)
+            
+            # Windows 下 Edge 额外尝试指定用户目录
+            if browser == "edge" and is_windows:
+                try:
+                    cj = browser_func(domain_name=".bilibili.com")
+                except Exception:
+                    # 尝试显式指定 Cookie 文件路径（Win10/11 默认路径）
+                    default_cookie_path = os.path.expandvars(
+                        r"%LOCALAPPDATA%\Microsoft\Edge\User Data\Default\Network\Cookies"
+                    )
+                    if os.path.exists(default_cookie_path):
+                        try:
+                            cj = browser_func(cookie_file=default_cookie_path, 
+                                            domain_name=".bilibili.com")
+                        except Exception:
+                            # 再尝试不指定 domain，全量提取后过滤
+                            cj = browser_func(cookie_file=default_cookie_path)
+                    else:
+                        raise
+            else:
+                cj = browser_func(domain_name=".bilibili.com")
+
+            # 提取 bilibili 相关 Cookie
+            cookies = {}
+            for c in cj:
+                if ".bilibili.com" in c.domain or "bilibili.com" in c.domain:
+                    cookies[c.name] = c.value
+            
+            # 关键凭证校验：至少要有 SESSDATA 才算有效登录
+            if cookies and "SESSDATA" in cookies:
                 return cookies, browser
         except Exception:
             continue
+    
     return None, None
 
 def get_wbi_keys(session, cookies=None):
@@ -294,8 +338,7 @@ def merge_with_ffmpeg(video_path, audio_path, output_path):
         "-map", "0:v:0",
         "-map", "1:a:0",
         "-shortest",
-        "-y",
-        output_path
+        "-y", output_path
     ]
     try:
         subprocess.run(cmd, check=True, capture_output=True, text=True)
@@ -309,7 +352,6 @@ def fetch_danmaku_xml(session, cid, cookies=None):
     all_danmaku = []
     segment_index = 1
     max_segments = 50
-
     while segment_index <= max_segments:
         url = "https://api.bilibili.com/x/v2/dm/list/seg.so"
         params = {
@@ -324,29 +366,23 @@ def fetch_danmaku_xml(session, cid, cookies=None):
             data = resp.json()
         except Exception:
             break
-
         if data.get("code") != 0:
             break
-
         seg_data = data.get("data", {})
         seg_list = seg_data.get("seg", [])
         if not seg_list:
             break
-
         for seg in seg_list:
             dm_list = seg.get("dm", [])
             all_danmaku.extend(dm_list)
-
             if seg.get("flag") is True:
                 segment_index += 1
             else:
                 break
         else:
             break
-
     if not all_danmaku:
         return _fetch_danmaku_xml_fallback(session, cid, cookies)
-
     lines = ['<i>']
     for dm in all_danmaku:
         progress = dm.get("progress", 0)
@@ -359,11 +395,11 @@ def fetch_danmaku_xml(session, cid, cookies=None):
         dm_id = dm.get("id", 0)
         content = dm.get("content", "")
         content_escaped = (content
-                           .replace("&", "&amp;")
-                           .replace("<", "&lt;")
-                           .replace(">", "&gt;")
-                           .replace('"', "&quot;")
-                           .replace("'", "&apos;"))
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;")
+            .replace("'", "&apos;"))
         p_attr = f'{progress},{mode},{fontsize},{color},{ctime},{pool},{uid_hash},{dm_id}'
         lines.append(f'  <d p="{p_attr}">{content_escaped}</d>')
     lines.append('</i>')
@@ -541,7 +577,9 @@ class BiliDownloaderApp:
 
         # 主题切换后刷新所有打开的对话框（如果有）—— 但此处简化，只刷新自身
 
-    # ---------- 全局样式 / 字体 ----------
+    # ====================================================================
+    # 全局样式 / 字体
+    # ====================================================================
     def _on_tab_changed(self, event=None):
         if not self._ranking_initialized:
             current_tab = self.notebook.index(self.notebook.select())
@@ -595,92 +633,131 @@ class BiliDownloaderApp:
         self._theme = theme
         self.current_theme.set(theme)
         save_theme(theme)
-
         if HAS_SV_TTK:
             sv_ttk.set_theme(theme)
         else:
             c = self._get_theme_colors()
-            self.root.tk_setPalette(background=c["dialog_bg"], foreground=c["fg"],
-                                    activeBackground=c["menu_active_bg"],
-                                    activeForeground=c["menu_active_fg"],
-                                    highlightBackground=c["border"],
-                                    highlightColor=c["accent"])
-
+            self.root.tk_setPalette(
+                background=c["dialog_bg"],
+                foreground=c["fg"],
+                activeBackground=c["menu_active_bg"],
+                activeForeground=c["menu_active_fg"],
+                highlightBackground=c["border"],
+                highlightColor=c["accent"]
+            )
         self._apply_theme_to_all()
 
     def _get_theme_colors(self):
         if getattr(self, "_theme", "light") == "dark":
             return {
-                "bg": "#1e1e1e", "fg": "#d4d4d4", "insert": "#ffffff",
-                "select_bg": "#094771", "select_fg": "#ffffff",
-                "tree_bg": "#252526", "tree_fg": "#d4d4d4",
-                "tree_sel_bg": "#094771", "tree_sel_fg": "#ffffff",
-                "tree_heading_bg": "#3c3c3c", "tree_heading_fg": "#d4d4d4",
+                "bg": "#1e1e1e",
+                "fg": "#d4d4d4",
+                "insert": "#ffffff",
+                "select_bg": "#094771",
+                "select_fg": "#ffffff",
+                "tree_bg": "#252526",
+                "tree_fg": "#d4d4d4",
+                "tree_sel_bg": "#094771",
+                "tree_sel_fg": "#ffffff",
+                "tree_heading_bg": "#3c3c3c",
+                "tree_heading_fg": "#d4d4d4",
                 "tree_border": "#555555",
-                "dialog_bg": "#1e1e1e", "canvas_bg": "#1e1e1e", "root_bg": "#1e1e1e",
-                "menu_bg": "#2d2d2d", "menu_fg": "#d4d4d4",
-                "menu_active_bg": "#094771", "menu_active_fg": "#ffffff",
+                "dialog_bg": "#1e1e1e",
+                "canvas_bg": "#1e1e1e",
+                "root_bg": "#1e1e1e",
+                "menu_bg": "#2d2d2d",
+                "menu_fg": "#d4d4d4",
+                "menu_active_bg": "#094771",
+                "menu_active_fg": "#ffffff",
                 "menu_border": "#3c3c3c",
-                "accent": "#0078d7", "border": "#3c3c3c",
-                "log_info": "#d4d4d4", "log_warning": "#ffcc00", "log_error": "#f44747",
+                "accent": "#0078d7",
+                "border": "#3c3c3c",
+                "log_info": "#d4d4d4",
+                "log_warning": "#ffcc00",
+                "log_error": "#f44747",
             }
         else:
             return {
-                "bg": "#ffffff", "fg": "#000000", "insert": "#000000",
-                "select_bg": "#0078d7", "select_fg": "#ffffff",
-                "tree_bg": "#ffffff", "tree_fg": "#000000",
-                "tree_sel_bg": "#0078d7", "tree_sel_fg": "#ffffff",
-                "tree_heading_bg": "#f0f0f0", "tree_heading_fg": "#000000",
+                "bg": "#ffffff",
+                "fg": "#000000",
+                "insert": "#000000",
+                "select_bg": "#0078d7",
+                "select_fg": "#ffffff",
+                "tree_bg": "#ffffff",
+                "tree_fg": "#000000",
+                "tree_sel_bg": "#0078d7",
+                "tree_sel_fg": "#ffffff",
+                "tree_heading_bg": "#f0f0f0",
+                "tree_heading_fg": "#000000",
                 "tree_border": "#cccccc",
-                "dialog_bg": "#f0f0f0", "canvas_bg": "#ffffff", "root_bg": "#f0f0f0",
-                "menu_bg": "#f0f0f0", "menu_fg": "#000000",
-                "menu_active_bg": "#0078d7", "menu_active_fg": "#ffffff",
+                "dialog_bg": "#f0f0f0",
+                "canvas_bg": "#ffffff",
+                "root_bg": "#f0f0f0",
+                "menu_bg": "#f0f0f0",
+                "menu_fg": "#000000",
+                "menu_active_bg": "#0078d7",
+                "menu_active_fg": "#ffffff",
                 "menu_border": "#cccccc",
-                "accent": "#0078d7", "border": "#cccccc",
-                "log_info": "#000000", "log_warning": "#cc7700", "log_error": "#d12c2c",
+                "accent": "#0078d7",
+                "border": "#cccccc",
+                "log_info": "#000000",
+                "log_warning": "#cc7700",
+                "log_error": "#d12c2c",
             }
 
     # ---------- 通用主题辅助方法 ----------
     def _theme_text_widget(self, widget):
         c = self._get_theme_colors()
-        widget.config(bg=c["bg"], fg=c["fg"],
-                      insertbackground=c["insert"],
-                      selectbackground=c["select_bg"],
-                      selectforeground=c["select_fg"],
-                      borderwidth=0, highlightthickness=0)
+        widget.config(
+            bg=c["bg"], fg=c["fg"],
+            insertbackground=c["insert"],
+            selectbackground=c["select_bg"],
+            selectforeground=c["select_fg"],
+            borderwidth=0, highlightthickness=0
+        )
 
     def _theme_menu(self, menu):
         c = self._get_theme_colors()
         try:
-            menu.config(bg=c["menu_bg"], fg=c["menu_fg"],
-                        activebackground=c["menu_active_bg"],
-                        activeforeground=c["menu_active_fg"],
-                        borderwidth=0, relief=tk.FLAT)
+            menu.config(
+                bg=c["menu_bg"], fg=c["menu_fg"],
+                activebackground=c["menu_active_bg"],
+                activeforeground=c["menu_active_fg"],
+                borderwidth=0, relief=tk.FLAT
+            )
         except tk.TclError:
             pass
 
     def _theme_treeview(self, tree, style_name):
         c = self._get_theme_colors()
         style = ttk.Style()
-        style.configure(style_name,
-                        background=c["tree_bg"],
-                        foreground=c["tree_fg"],
-                        fieldbackground=c["tree_bg"],
-                        rowheight=24,
-                        borderwidth=0,
-                        relief=tk.FLAT)
-        style.map(style_name,
-                  background=[("selected", c["tree_sel_bg"])],
-                  foreground=[("selected", c["tree_sel_fg"])])
-        style.configure(f"{style_name}.Heading",
-                        background=c["tree_heading_bg"],
-                        foreground=c["tree_heading_fg"],
-                        borderwidth=0,
-                        relief=tk.FLAT,
-                        font=FONT_BODY_BOLD)
-        style.map(f"{style_name}.Heading",
-                  background=[("active", c["menu_active_bg"])],
-                  foreground=[("active", c["menu_active_fg"])])
+        style.configure(
+            style_name,
+            background=c["tree_bg"],
+            foreground=c["tree_fg"],
+            fieldbackground=c["tree_bg"],
+            rowheight=24,
+            borderwidth=0,
+            relief=tk.FLAT
+        )
+        style.map(
+            style_name,
+            background=[("selected", c["tree_sel_bg"])],
+            foreground=[("selected", c["tree_sel_fg"])]
+        )
+        style.configure(
+            f"{style_name}.Heading",
+            background=c["tree_heading_bg"],
+            foreground=c["tree_heading_fg"],
+            borderwidth=0,
+            relief=tk.FLAT,
+            font=FONT_BODY_BOLD
+        )
+        style.map(
+            f"{style_name}.Heading",
+            background=[("active", c["menu_active_bg"])],
+            foreground=[("active", c["menu_active_fg"])]
+        )
         try:
             tree.configure(style=style_name)
         except tk.TclError:
@@ -725,11 +802,12 @@ class BiliDownloaderApp:
 
     def _theme_listbox(self, listbox):
         c = self._get_theme_colors()
-        listbox.config(bg=c["tree_bg"], fg=c["tree_fg"],
-                       selectbackground=c["tree_sel_bg"],
-                       selectforeground=c["tree_sel_fg"],
-                       borderwidth=0, highlightthickness=0,
-                       relief=tk.FLAT)
+        listbox.config(
+            bg=c["tree_bg"], fg=c["tree_fg"],
+            selectbackground=c["tree_sel_bg"],
+            selectforeground=c["tree_sel_fg"],
+            borderwidth=0, highlightthickness=0, relief=tk.FLAT
+        )
 
     # ---------- 主题化对话框 ----------
     def _show_message(self, title, message, kind="info", parent=None):
@@ -750,10 +828,10 @@ class BiliDownloaderApp:
         icon_map = {"info": "ℹ", "warning": "⚠", "error": "✕", "confirm": "?"}
         c = self._get_theme_colors()
         icon_text = icon_map.get(kind, "ℹ")
+
         msg_frame = ttk.Frame(dialog)
         msg_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=(15, 8))
-        ttk.Label(msg_frame, text=icon_text, font=(FONT_FAMILY, 22, "bold"),
-                  foreground=c["accent"]).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(msg_frame, text=icon_text, font=(FONT_FAMILY, 22, "bold"), foreground=c["accent"]).pack(side=tk.LEFT, padx=(0, 12))
         ttk.Label(msg_frame, text=message, font=FONT_DIALOG, wraplength=wrap).pack(
             side=tk.LEFT, fill=tk.BOTH, expand=True)
 
@@ -795,23 +873,21 @@ class BiliDownloaderApp:
         dialog.title("选择分 P")
         dialog.transient(self.root)
         dialog.grab_set()
-
         n = len(pages)
         dialog.geometry(f"480x{min(120 + n * 22, 520)}")
         dialog.resizable(False, True)
 
-        ttk.Label(dialog, text=f"请选择要下载的分 P (1-{n})：",
-                  font=FONT_DIALOG).pack(anchor=tk.W, padx=15, pady=(12, 4))
+        ttk.Label(dialog, text=f"请选择要下载的分 P (1-{n})：", font=FONT_DIALOG).pack(anchor=tk.W, padx=15, pady=(12, 4))
 
         list_frame = ttk.Frame(dialog)
         list_frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=4)
-        listbox = tk.Listbox(list_frame, font=FONT_BODY, selectmode=tk.BROWSE,
-                             activestyle=tk.NONE, borderwidth=0, highlightthickness=0)
+        listbox = tk.Listbox(list_frame, font=FONT_BODY, selectmode=tk.BROWSE, activestyle=tk.NONE, borderwidth=0, highlightthickness=0)
         self._theme_listbox(listbox)
         vsb = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=listbox.yview)
         listbox.configure(yscrollcommand=vsb.set)
         listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         vsb.pack(side=tk.LEFT, fill=tk.Y)
+
         for item in p_list:
             listbox.insert(tk.END, item)
         listbox.selection_set(0)
@@ -823,7 +899,7 @@ class BiliDownloaderApp:
             sel = listbox.curselection()
             if sel:
                 result["value"] = sel[0]
-            dialog.destroy()
+                dialog.destroy()
 
         def _cancel():
             result["value"] = None
@@ -845,7 +921,6 @@ class BiliDownloaderApp:
     def create_download_tab(self):
         main_frame = ttk.Frame(self.download_frame, padding="10")
         main_frame.pack(fill=tk.BOTH, expand=True)
-
         main_frame.rowconfigure(2, weight=1)
         main_frame.columnconfigure(0, weight=1)
 
@@ -856,9 +931,11 @@ class BiliDownloaderApp:
         input_frame.columnconfigure(1, weight=1)
 
         ttk.Checkbutton(input_frame, text="批量模式 (每行一个)", variable=self.batch_mode_var).grid(row=0, column=0, sticky=tk.W, padx=5)
+
         self.entry = tk.Text(input_frame, height=3 if self.batch_mode_var.get() else 1, font=FONT_BODY)
         self.entry.grid(row=1, column=0, columnspan=2, sticky=tk.EW, padx=5, pady=5)
         self.batch_mode_var.trace('w', self.toggle_batch_mode)
+
         btn_frame = ttk.Frame(input_frame)
         btn_frame.grid(row=1, column=2, padx=5, sticky=tk.N)
         ttk.Button(btn_frame, text="解析并下载", command=self.start_download).pack(side=tk.LEFT, padx=2)
@@ -887,9 +964,7 @@ class BiliDownloaderApp:
         cookie_btn_frame.grid(row=2, column=2, sticky=tk.W, padx=5)
         self.browse_cookie_btn = ttk.Button(cookie_btn_frame, text="浏览", command=self.browse_cookie)
         self.browse_cookie_btn.pack(side=tk.LEFT)
-        self.use_cookies_cb = ttk.Checkbutton(cookie_btn_frame, text="使用Cookies",
-                                               variable=self.use_cookies_var,
-                                               command=self._toggle_cookie_controls)
+        self.use_cookies_cb = ttk.Checkbutton(cookie_btn_frame, text="使用Cookies", variable=self.use_cookies_var, command=self._toggle_cookie_controls)
         self.use_cookies_cb.pack(side=tk.LEFT, padx=(5, 0))
         self._toggle_cookie_controls()
 
@@ -922,7 +997,6 @@ class BiliDownloaderApp:
 
         self.log_text = tk.Text(log_frame, height=10, wrap=tk.WORD, state=tk.DISABLED, font=FONT_BODY)
         self._bind_copy_menu(self.log_text)
-
         scrollbar = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=scrollbar.set)
         self.log_text.grid(row=0, column=0, sticky=tk.NSEW)
@@ -940,8 +1014,7 @@ class BiliDownloaderApp:
 
         self.progress = ttk.Progressbar(status_frame, mode='determinate')
         self.progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
-        self.status_label = ttk.Label(status_frame, textvariable=self.status_var,
-                                      width=22, font=FONT_SMALL)
+        self.status_label = ttk.Label(status_frame, textvariable=self.status_var, width=22, font=FONT_SMALL)
         self.status_label.pack(side=tk.RIGHT, padx=5)
 
     def toggle_batch_mode(self, *args):
@@ -967,8 +1040,8 @@ class BiliDownloaderApp:
             text_widget.mark_set(tk.INSERT, "1.0")
             text_widget.see(tk.INSERT)
 
-        menu.add_command(label="全选   Ctrl+A", command=_select_all)
-        menu.add_command(label="复制   Ctrl+C", command=_copy)
+        menu.add_command(label="全选 Ctrl+A", command=_select_all)
+        menu.add_command(label="复制 Ctrl+C", command=_copy)
 
         def show_menu(event):
             try:
@@ -1048,7 +1121,10 @@ class BiliDownloaderApp:
             return "break"
 
     def browse_cookie(self):
-        filename = filedialog.askopenfilename(title="选择 Cookies 文件", filetypes=[("JSON files", "*.json"), ("All files", "*.*")])
+        filename = filedialog.askopenfilename(
+            title="选择 Cookies 文件",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
+        )
         if filename:
             self.cookies_file_var.set(filename)
 
@@ -1156,7 +1232,6 @@ class BiliDownloaderApp:
         self.log("========== 开始批量下载 ==========")
         self.progress['value'] = 0
         self.status_var.set("准备下载...")
-
         self.is_downloading = True
         thread = threading.Thread(target=self.batch_download_worker, args=(items,), daemon=True)
         thread.start()
@@ -1195,12 +1270,13 @@ class BiliDownloaderApp:
             self.log("未能获取 Cookies，将使用无 Cookie 模式（可能受限）", "WARNING")
 
         session = get_session_with_retry()
-
         try:
-            video_info = get_video_info(session,
-                                        bvid=id_val if id_type=="bvid" else None,
-                                        aid=id_val if id_type=="aid" else None,
-                                        cookies=cookies)
+            video_info = get_video_info(
+                session,
+                bvid=id_val if id_type=="bvid" else None,
+                aid=id_val if id_type=="aid" else None,
+                cookies=cookies
+            )
         except Exception as e:
             self.log(f"获取视频信息失败: {e}", "ERROR")
             return
@@ -1241,7 +1317,6 @@ class BiliDownloaderApp:
         }
 
         success = self.download_single_worker()
-
         if success:
             history_entry = {
                 "bvid": bvid,
@@ -1259,6 +1334,7 @@ class BiliDownloaderApp:
         if not self.use_cookies_var.get():
             self.log("已禁用 Cookies，使用无 Cookie 模式（清晰度可能受限）", "INFO")
             return None
+
         cookies = None
         if self.cookies_file_var.get():
             try:
@@ -1278,16 +1354,22 @@ class BiliDownloaderApp:
                     return cookies
                 except Exception as e:
                     self.log(f"加载本地 cookies.json 失败: {e}", "WARNING")
-            self.log("尝试从浏览器获取 Cookies...")
-            try:
-                cookies, browser = get_cookies_from_browser_auto()
-                if cookies:
-                    self.log(f"已从 {browser} 获取 Cookies")
+
+        self.log("尝试从浏览器获取 Cookies...")
+        try:
+            cookies, browser = get_cookies_from_browser_auto()
+            if cookies:
+                # 检查关键凭证
+                if "SESSDATA" in cookies:
+                    self.log(f"已从 {browser} 获取 Cookies（登录有效）")
                     return cookies
                 else:
-                    self.log("未能从任何浏览器获取 Cookies，将使用无 Cookie 模式（可能受限）", "WARNING")
-            except Exception as e:
-                self.log(f"浏览器获取失败: {e}", "WARNING")
+                    self.log(f"从 {browser} 获取到 Cookies，但缺少 SESSDATA，可能未登录B站", "WARNING")
+            else:
+                self.log("未能从任何浏览器获取有效登录凭证，将使用无 Cookie 模式（清晰度可能受限）", "WARNING")
+        except Exception as e:
+            self.log(f"浏览器自动获取失败: {e}", "WARNING")
+
         return None
 
     def download_single_worker(self):
@@ -1300,7 +1382,11 @@ class BiliDownloaderApp:
         cookies = params['cookies']
 
         try:
-            video_url, audio_url = get_playurl(session, bvid, cid, qn=self.qn_var.get(), cookies=cookies)
+            video_url, audio_url = get_playurl(
+                session, bvid, cid,
+                qn=self.qn_var.get(),
+                cookies=cookies
+            )
             self.log("获取播放地址成功")
         except Exception as e:
             self.log(f"获取播放地址失败: {e}", "ERROR")
@@ -1324,6 +1410,7 @@ class BiliDownloaderApp:
                 app_dir = get_app_dir()
         else:
             app_dir = get_app_dir()
+
         video_file = os.path.join(app_dir, f"{base_name}_video.mp4")
         audio_file = os.path.join(app_dir, f"{base_name}_audio.m4a")
         output_file = os.path.join(app_dir, f"{base_name}.mp4")
@@ -1414,9 +1501,11 @@ class BiliDownloaderApp:
         self.status_var.set("完成")
         self.progress['value'] = 100
         self.is_downloading = False
+
         if self.exit_after_var.get():
             self.log("3秒后自动关闭程序...")
             self.root.after(3000, self.root.destroy)
+
         return True
 
     # ---------- 排行榜标签页 ----------
@@ -1438,29 +1527,25 @@ class BiliDownloaderApp:
 
         ttk.Label(ctrl_frame, text="维度:").pack(side=tk.LEFT, padx=(8, 2))
         self.rank_type_var = tk.StringVar(value="人气榜")
-        rank_type_combo = ttk.Combobox(ctrl_frame, textvariable=self.rank_type_var, state="readonly",
-                                        values=["人气榜", "最新发布", "入站必看"], width=9)
+        rank_type_combo = ttk.Combobox(ctrl_frame, textvariable=self.rank_type_var, state="readonly", values=["人气榜", "最新发布", "入站必看"], width=9)
         rank_type_combo.pack(side=tk.LEFT, padx=2)
         rank_type_combo.bind("<<ComboboxSelected>>", lambda e: self.refresh_ranking())
 
         ttk.Label(ctrl_frame, text="单位:").pack(side=tk.LEFT, padx=(8, 2))
         self.unit_var = tk.StringVar(value="自适应")
-        unit_combo = ttk.Combobox(ctrl_frame, textvariable=self.unit_var, state="readonly",
-                                  values=["自适应", "千分位", "W(万)", "K/M"], width=8)
+        unit_combo = ttk.Combobox(ctrl_frame, textvariable=self.unit_var, state="readonly", values=["自适应", "千分位", "W(万)", "K/M"], width=8)
         unit_combo.pack(side=tk.LEFT, padx=2)
         unit_combo.bind("<<ComboboxSelected>>", lambda e: self.apply_unit_change())
 
         ttk.Label(ctrl_frame, text="数量:").pack(side=tk.LEFT, padx=(8, 2))
         self.ranking_count_var = tk.IntVar(value=20)
-        count_combo = ttk.Combobox(ctrl_frame, textvariable=self.ranking_count_var, state="readonly",
-                                   values=[10, 20, 50, 100], width=5)
+        count_combo = ttk.Combobox(ctrl_frame, textvariable=self.ranking_count_var, state="readonly", values=[10, 20, 50, 100], width=5)
         count_combo.pack(side=tk.LEFT, padx=2)
         count_combo.bind("<<ComboboxSelected>>", lambda e: self.refresh_ranking())
 
         ttk.Label(ctrl_frame, text="视图:").pack(side=tk.LEFT, padx=(8, 2))
         self.view_var = tk.StringVar(value="表格")
-        view_combo = ttk.Combobox(ctrl_frame, textvariable=self.view_var, state="readonly",
-                                  values=["表格", "封面卡片"], width=9)
+        view_combo = ttk.Combobox(ctrl_frame, textvariable=self.view_var, state="readonly", values=["表格", "封面卡片"], width=9)
         view_combo.pack(side=tk.LEFT, padx=2)
         view_combo.bind("<<ComboboxSelected>>", lambda e: self.switch_view())
 
@@ -1473,10 +1558,8 @@ class BiliDownloaderApp:
         # ---- 表格视图 ----
         tree_frame = ttk.Frame(self.content_frame)
         self.tree_view_frame = tree_frame
-
         columns = ("#", "标题", "UP主", "播放量", "弹幕")
-        self.ranking_tree = ttk.Treeview(tree_frame, columns=columns, show="headings",
-                                         height=12, selectmode="extended")
+        self.ranking_tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=12, selectmode="extended")
         self.ranking_tree.heading("#", text="序号")
         self.ranking_tree.heading("标题", text="标题")
         self.ranking_tree.heading("UP主", text="UP主")
@@ -1492,29 +1575,25 @@ class BiliDownloaderApp:
         self.ranking_tree.configure(yscrollcommand=scrollbar.set)
         self.ranking_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
         self.ranking_tree.bind("<Double-1>", self.on_tree_double_click)
 
         # ---- 卡片视图 ----
         card_frame = ttk.Frame(self.content_frame)
         self.card_view_frame = card_frame
-
         self.card_canvas = tk.Canvas(card_frame, borderwidth=0, highlightthickness=0)
         card_scroll = ttk.Scrollbar(card_frame, orient=tk.VERTICAL, command=self.card_canvas.yview)
         self.card_inner = ttk.Frame(self.card_canvas)
-        self.card_inner.bind("<Configure>",
-                             lambda e: self.card_canvas.configure(scrollregion=self.card_canvas.bbox("all")))
+        self.card_inner.bind("<Configure>", lambda e: self.card_canvas.configure(scrollregion=self.card_canvas.bbox("all")))
         self.card_window = self.card_canvas.create_window((0, 0), window=self.card_inner, anchor="nw")
         self.card_canvas.configure(yscrollcommand=card_scroll.set)
         self.card_canvas.bind("<Configure>", self.on_card_canvas_configure)
         self.card_canvas.bind("<Enter>", lambda e: self._bind_mousewheel(self.card_canvas))
         self.card_canvas.bind("<Leave>", lambda e: self._unbind_mousewheel())
-
         self.card_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         card_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
         self.card_photo_refs = []
         self.card_widgets = []
-
         self.current_view = "表格"
         tree_frame.pack(fill=tk.BOTH, expand=True)
 
@@ -1538,17 +1617,16 @@ class BiliDownloaderApp:
 
         ttk.Button(btn_frame, text="下载选中视频", command=self.download_selected_ranking).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="打开链接 (浏览器)", command=self.open_selected_link).pack(side=tk.LEFT, padx=5)
+
         ttk.Label(btn_frame, text="提示: 表格支持 Ctrl/Shift 多选；卡片视图用勾选框").pack(side=tk.LEFT, padx=15)
 
         self.ranking_list = []
 
     def init_ranking_zones(self):
         self.status_ranking.config(text="加载分区列表...")
-
         def fetch():
             zones = fetch_zones_from_github()
             self.root.after(0, lambda: self._apply_zones(zones))
-
         threading.Thread(target=fetch, daemon=True).start()
 
     def _apply_zones(self, zones):
@@ -1557,6 +1635,7 @@ class BiliDownloaderApp:
             self.log("使用内置备用分区列表", "WARNING")
         else:
             self.log("成功获取分区列表", "INFO")
+
         sorted_names = sorted(zones.keys())
         self.zone_combo['values'] = sorted_names
         self.zone_map = zones
@@ -1583,6 +1662,7 @@ class BiliDownloaderApp:
 
         self.status_ranking.config(text=f"加载中... ({rank_type_text})")
         self.refresh_btn.config(state=tk.DISABLED)
+
         for item in self.ranking_tree.get_children():
             self.ranking_tree.delete(item)
         self.ranking_list.clear()
@@ -1590,7 +1670,6 @@ class BiliDownloaderApp:
         def fetch():
             data = get_ranking_data(rid, rank_type)
             self.root.after(0, lambda: self.update_ranking_table(data))
-
         threading.Thread(target=fetch, daemon=True).start()
 
     def _current_unit_mode(self):
@@ -1615,8 +1694,8 @@ class BiliDownloaderApp:
 
         display_count = self.ranking_count_var.get()
         data = data[:display_count]
-
         mode = self._current_unit_mode()
+
         for idx, item in enumerate(data, 1):
             bvid = item.get("bvid", "")
             title = item.get("title", "无标题")
@@ -1626,12 +1705,18 @@ class BiliDownloaderApp:
             view = stat.get("view", 0)
             danmaku = stat.get("danmaku", 0)
             pic = item.get("pic", "")
+
             view_str = format_count(view, mode)
             danmaku_str = format_count(danmaku, mode)
+
             self.ranking_tree.insert("", tk.END, values=(idx, title, up, view_str, danmaku_str))
             self.ranking_list.append({
-                "bvid": bvid, "title": title, "owner": up,
-                "view": view, "danmaku": danmaku, "pic": pic,
+                "bvid": bvid,
+                "title": title,
+                "owner": up,
+                "view": view,
+                "danmaku": danmaku,
+                "pic": pic,
             })
 
         self.status_ranking.config(text=f"共 {len(data)} 条")
@@ -1710,6 +1795,7 @@ class BiliDownloaderApp:
         if not self.batch_mode_var.get():
             self.batch_mode_var.set(True)
             self.toggle_batch_mode()
+
         self.entry.delete(1.0, tk.END)
         self.entry.insert(1.0, "\n".join(bvids))
 
@@ -1717,6 +1803,7 @@ class BiliDownloaderApp:
             msg = f"是否立即下载 {bvids[0]}？"
         else:
             msg = f"是否立即批量下载 {len(bvids)} 个视频？"
+
         if self._show_confirm("确认", msg):
             self.start_download()
 
@@ -1821,9 +1908,9 @@ class BiliDownloaderApp:
         self._cover_labels = []
 
         if not HAS_PIL:
-            ttk.Label(self.card_inner, text="未安装 Pillow (PIL)，无法显示卡片视图。\n请运行: pip install Pillow",
-                      foreground="red").grid(row=0, column=0, padx=10, pady=10)
+            ttk.Label(self.card_inner, text="未安装 Pillow (PIL)，无法显示卡片视图。\n请运行: pip install Pillow", foreground="red").grid(row=0, column=0, padx=10, pady=10)
             return
+
         if not self.ranking_list:
             ttk.Label(self.card_inner, text="暂无数据，请先刷新排行榜").grid(row=0, column=0, padx=10, pady=10)
             return
@@ -1849,18 +1936,20 @@ class BiliDownloaderApp:
             if len(title) > 22:
                 title = title[:21] + "…"
             ttk.Label(card, text=title, wraplength=150, font=FONT_SMALL_BOLD).grid(row=2, column=0, sticky="w", padx=2)
+            ttk.Label(card, text=f"UP: {info['owner']}", foreground="gray", font=FONT_SMALL).grid(row=3, column=0, sticky="w", padx=2)
 
-            ttk.Label(card, text=f"UP: {info['owner']}", foreground="gray",
-                      font=FONT_SMALL).grid(row=3, column=0, sticky="w", padx=2)
-
-            stat_text = f"播放 {format_count(info['view'], mode)}  弹幕 {format_count(info['danmaku'], mode)}"
+            stat_text = f"播放 {format_count(info['view'], mode)} 弹幕 {format_count(info['danmaku'], mode)}"
             ttk.Label(card, text=stat_text, font=FONT_SMALL).grid(row=4, column=0, sticky="w", padx=2)
 
             card.bind("<Double-1>", lambda e, bv=info["bvid"]: self._download_one(bv))
 
             cw = {
-                "frame": card, "bvid": info["bvid"], "title": info["title"],
-                "view": info["view"], "danmaku": info["danmaku"], "select_var": select_var,
+                "frame": card,
+                "bvid": info["bvid"],
+                "title": info["title"],
+                "view": info["view"],
+                "danmaku": info["danmaku"],
+                "select_var": select_var,
             }
             self.card_widgets.append(cw)
             cover_labels.append((cover_lbl, info["bvid"], info["pic"]))
@@ -1885,7 +1974,7 @@ class BiliDownloaderApp:
     def _apply_covers_in_batches(self, results, start_idx, gen):
         if gen != self._cover_gen:
             return
-        batch = results[start_idx:start_idx + 8]  # 增加批次大小以提高渲染效率
+        batch = results[start_idx:start_idx + 8]
         for lbl, img in batch:
             self._apply_cover_to_label(lbl, img, gen)
         next_idx = start_idx + 8
@@ -1940,6 +2029,7 @@ class BiliDownloaderApp:
 - 修复图标显示问题 (标题栏/任务栏)
 - 修复暗色主题不完整问题
 - 优化卡片视图加载性能
+- 优化 Edge 浏览器 Cookie 自动获取逻辑
 
 说明文档:
 • 使用前请确保已登录 B 站 (用于获取高画质)
@@ -1953,9 +2043,9 @@ Cookies 说明:
 • 默认读取程序同目录的 cookies.json，无需手动指定
 • 支持两种 JSON 格式:
   1. 字典格式: {{"SESSDATA": "xxx", "bili_jct": "xxx"}}
-  2. 数组格式: 浏览器插件导出的 JSON 数组
-     [{{"name": "SESSDATA", "value": "xxx", ...}}, ...]
+  2. 数组格式: 浏览器插件导出的 JSON 数组 [{{"name": "SESSDATA", "value": "xxx", ...}}, ...]
 • 关键字段: SESSDATA (登录凭证)、bili_jct (CSRF)
+• 浏览器自动获取优先尝试 Edge，支持 Windows 默认路径兜底
 
 排行榜说明:
 • 不需要 Cookies，公开接口直接访问
@@ -1997,7 +2087,6 @@ GitHub 项目:
 
             btn_github = ttk.Button(dialog, text="打开 GitHub 仓库", command=open_github)
             btn_github.pack(pady=5)
-
             btn_close = ttk.Button(dialog, text="关闭", command=dialog.destroy)
             btn_close.pack(pady=5)
         except Exception as e:
